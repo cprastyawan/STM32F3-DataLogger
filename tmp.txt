@@ -1,0 +1,265 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <SPI.h>
+#include <RtcDS3231.h>
+#include <SD.h>
+#include <Adafruit_BMP280.h>
+#include <ADS1X15.h>
+
+#define ACS712_30 0.065
+
+typedef union{
+  float f32;
+  uint8_t c8[4];
+} Floating;
+
+uint8_t send[8];
+
+Floating T_send, P_send, I_send, V_send, W_send;
+
+HardwareSerial Serial2(PA3, PA2);
+LiquidCrystal_I2C lcd(0x27, 20, 4);
+//SPIClass SPIESP32(PB15, PB14, PB13, PB12);
+
+RtcDateTime dt;
+RtcDS3231<TwoWire> Rtc(Wire);
+char dateTimeString[25];
+char dateString[16];
+char timeString[16];
+
+uint32_t previousMillis = 0;
+uint32_t sdCardPrevMillis = 0;
+
+Adafruit_BMP280 bmp;
+
+float temperature[5];
+float temperatureTotal = 0.0;
+float pressure[5];
+float pressureTotal = 0.0;
+
+float voltage[5];
+float voltRawTotal = 0.0;
+float voltTotal = 0.0;
+
+File logFile;
+
+ADS1115 ads(0x48);
+const float ADSMultiplier = 0.1875F;
+uint32_t currentRawTotal = 0;
+float currentZeroPoint = 0;
+float current[5];
+uint16_t currentRaw = 0;
+float currentTotal;
+
+uint32_t count = 0;
+uint8_t dataCount = 0;
+
+uint32_t inputRising = 0;
+float anemoFrequency = 0.0;
+
+char sendJSON[1000];
+
+float wSpeed[5];
+float wDir[5];
+
+void sendToESP();
+
+void WindVelocity(){
+  uint32_t period = millis() - inputRising;
+
+  inputRising = millis();
+  anemoFrequency = 1 / (float)period;
+}
+
+void setup() {
+  // put your setup code here, to run once:
+  Serial2.begin(115200);
+  Wire.setSDA(PB7);
+  Wire.setSCL(PB6);
+
+  SPI.setMISO(PB4);
+  SPI.setMOSI(PB5);
+  SPI.setSCLK(PB3);
+  SPI.setSSEL(PA15);
+
+  analogReadResolution(12);
+
+  lcd.init();
+  lcd.clear();
+  lcd.backlight();
+
+  lcd.setCursor(4,0);
+  lcd.print("YAKINJAYA");
+  lcd.setCursor(2,1);
+  lcd.print("Data Logger");
+  delay(2000);
+
+  Rtc.Begin();
+  RtcDateTime compiled = RtcDateTime(__DATE__, __TIME__);
+
+  if(!Rtc.GetIsRunning()) Rtc.SetIsRunning(true);
+
+  RtcDateTime now = Rtc.GetDateTime();
+  if(now < compiled) Rtc.SetDateTime(compiled);
+
+  /*if(!SD.begin(PA15)){
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("SDCard gagal!");
+    while(1);
+  }*/
+
+  if(!bmp.begin(0x76)){
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("BMP280 gagal!");
+    while(1);
+  }
+
+  if(!ads.begin()){
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("ADS1115 gagal!");
+    while(1);
+  }
+
+  ads.setGain(0);
+  ads.setMode(0);
+
+  for(int i = 0; i < 20; i++){
+    currentRawTotal += ads.toVoltage(ads.readADC(0));
+  }
+
+  currentZeroPoint = currentRawTotal / 20;
+
+  
+  //pinMode(PA10, INPUT_PULLUP);
+  //attachInterrupt(PA10, WindVelocity, FALLING);
+  inputRising = millis();
+
+  delay(2000);
+  lcd.clear();
+  previousMillis = millis();
+}
+
+void loop() {
+  // put your main code here, to run repeatedly:
+  dt = Rtc.GetDateTime();
+  temperatureTotal += bmp.readTemperature();
+  pressureTotal += bmp.readPressure() / 100;
+  currentTotal += ads.toVoltage(ads.readADC(0));
+  voltTotal += ads.toVoltage(ads.readADC(1));
+  count += 1;
+
+  //voltReal = voltRawTotal / count;
+  //voltRealTotal += 3.30 * ((float)voltRaw / 4096.0) * ((560.0 + 6900.0) / 560.0);
+
+  
+  if(dataCount >= 5) {
+    dataCount = 0;
+  }
+
+  if(millis() - previousMillis >= 1000){
+    previousMillis = millis();
+    lcd.clear();
+
+    current[dataCount] = currentTotal / count - currentZeroPoint;
+    currentTotal = 0;
+
+    temperature[dataCount] = temperatureTotal / count;
+    temperatureTotal = 0;
+
+    pressure[dataCount] = pressureTotal / count;
+    pressureTotal = 0;
+
+    voltage[dataCount] = voltTotal / count;
+    voltTotal = 0;
+
+    sprintf(dateString, "%02u/%02u/%04u", dt.Day(), dt.Month(), dt.Year());
+    sprintf(timeString, "%02u:%02u:%02u", dt.Hour(), dt.Minute(), dt.Second());
+    lcd.setCursor(0, 0);
+    lcd.print(String(dateString) + " " + String(timeString));
+
+    lcd.setCursor(0, 1);
+    lcd.print(String("I: ") + String(current[dataCount]) + String(" T: ") + String(temperature[dataCount]));
+
+    lcd.setCursor(0, 2);
+    lcd.print(String("P: ") + String(pressure[dataCount]) + String(" V: ") + String(voltage[dataCount]));
+
+    lcd.setCursor(0, 3);
+    lcd.print(String("WS: ") + String(wSpeed[dataCount]) + String(" WD: ") + String(wDir[dataCount]));
+
+    //sendToESP();
+
+    count = 0;
+    dataCount++;
+  }
+
+
+  //currentRawTotal += analogRead(PB1);
+  //count++;
+
+  if(millis() - sdCardPrevMillis >= 5000){
+    sdCardPrevMillis = millis();
+
+    //sendToESP();
+    /*logFile = SD.open("log.txt", FILE_WRITE);
+
+    if(logFile){
+      //Format data
+      logFile.println(dateTimeString + String("\tCurrent: ") + String(current) + String(" A") + String("\tTemperature: ") + String(temperature) + String(" C") + String("\tPressure: ") + String(pressure) + String(" hPa"));
+      logFile.close();
+    }*/
+  }
+}
+
+void sendToESP(){
+  Serial2.write("#D");
+  Serial2.write(dateString);
+  Serial2.write('S');
+
+  Serial2.write("#Y");
+  Serial2.write(timeString);
+  Serial2.write('S');
+
+  T_send.f32 = temperature;
+  send[0] = '#';
+  send[1] = 'T';
+  for(int i = 0; i < 4; i++){
+    send[i + 2] = T_send.c8[i];
+  }
+  send[6] = 'S';
+  send[7] = 0;
+  Serial2.write((char*)send);
+
+  P_send.f32 = pressure;
+  send[0] = '#';
+  send[1] = 'P';
+  for(int i = 0; i < 4; i++){
+    send[i + 2] = P_send.c8[i];
+  }
+  send[6] = 'S';
+  send[7] = 0;
+  Serial2.write((char*)send);
+
+  I_send.f32 = current;
+  send[0] = '#';
+  send[1] = 'I';
+  for(int i = 0; i < 4; i++){
+    send[i + 2] = I_send.c8[i];
+  }
+  send[6] = 'S';
+  send[7] = 0;
+  Serial2.write((char*)send);
+
+  V_send.f32 = voltReal;
+  send[0] = '#';
+  send[1] = 'V';
+  for(int i = 0; i < 4; i++){
+    send[i + 2] = V_send.c8[i];
+  }
+  send[6] = 'S';
+  send[7] = 0;
+  Serial2.write((char*)send);
+}
